@@ -13,7 +13,7 @@ import { neon } from "@neondatabase/serverless";
 
 const databaseUrl = process.env.DATABASE_URL;
 const password = process.env.SEED_USER_PASSWORD ?? "DemoPass123!";
-const adminEmail = process.env.SEED_ADMIN_EMAIL;
+const adminEmail = process.env.SEED_ADMIN_EMAIL ?? "admin@peoplepay360.test";
 
 if (!databaseUrl) {
   throw new Error("DATABASE_URL is not set");
@@ -103,6 +103,7 @@ async function resolveOrganization(): Promise<OrgRow> {
     select o.id, o.name,
            (select count(*) from employees e where e.organization_id = o.id)::int as employees
     from organizations o
+    where o.slug != 'peoplepay360-performance-test'
     order by employees desc, o.created_at desc
     limit 1
   `) as OrgRow[];

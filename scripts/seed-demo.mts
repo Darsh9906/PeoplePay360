@@ -1,5 +1,5 @@
 /**
- * Seeds a 251-employee demo workspace.
+ * Seeds a 50-employee demo workspace.
  *
  * DESTRUCTIVE. Every operational record in the target organization is removed
  * before seeding: employees, contracts, attendance, time off, payroll and
@@ -16,9 +16,9 @@ import { pbkdf2Sync, randomBytes } from "node:crypto";
 import { neon } from "@neondatabase/serverless";
 
 const databaseUrl = process.env.DATABASE_URL;
-const EMPLOYEE_COUNT = Number(process.env.SEED_EMPLOYEES ?? 251);
+const EMPLOYEE_COUNT = Number(process.env.SEED_EMPLOYEES ?? 50);
 /** Employees that get day-by-day attendance. The rest keep a lighter history. */
-const ATTENDANCE_SAMPLE = Number(process.env.SEED_ATTENDANCE_SAMPLE ?? 60);
+const ATTENDANCE_SAMPLE = Number(process.env.SEED_ATTENDANCE_SAMPLE ?? 34);
 const CHUNK = 500;
 
 /** Login created when the workspace has no admin yet. */
@@ -323,7 +323,7 @@ function generatePeople(count: number): DemoEmployee[] {
     const sequence = index + 1;
 
     // A deliberate mix so the status filter and headcount tiles have something
-    // to show. The first 235 stay active.
+    // to show. The first count - 16 stay active (e.g. 34 of 50).
     const status: DemoEmployee["status"] =
       index >= count - 6 ? "terminated" : index >= count - 16 ? "inactive" : "active";
 

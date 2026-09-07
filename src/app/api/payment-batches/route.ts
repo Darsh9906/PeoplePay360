@@ -5,10 +5,12 @@ import {
   employeeBankAccounts,
   paymentBatches,
   paymentTransactions,
+  payruns,
   payslips,
 } from "@/db/schema";
+import { canReadPayroll, isResponse, resolveAccess } from "../_lib/access";
 import { writeAuditLog } from "../_lib/audit";
-import { badRequest, created, ok, serverError } from "../_lib/responses";
+import { badRequest, created, forbidden, notFound, ok, serverError } from "../_lib/responses";
 
 const paymentBatchSchema = z.object({
   payrunId: z.string().uuid(),
@@ -17,13 +19,27 @@ const paymentBatchSchema = z.object({
 
 export async function GET() {
   try {
+    const access = await resolveAccess();
+
+    if (isResponse(access)) {
+      return access;
+    }
+
+    if (!canReadPayroll(access.user.role)) {
+      return forbidden("Your role does not allow this action");
+    }
+
     const rows = await db.query.paymentBatches.findMany({
       with: { transactions: true, payrun: true },
       orderBy: desc(paymentBatches.createdAt),
     });
 
+    const orgRows = rows.filter(
+      (batch) => batch.payrun?.organizationId === access.organizationId,
+    );
+
     return ok(
-      rows.map((batch) => ({
+      orgRows.map((batch) => ({
         ...batch,
         transactionCount: batch.transactions.length,
       })),
@@ -35,10 +51,28 @@ export async function GET() {
 
 export async function POST(request: Request) {
   try {
+    const access = await resolveAccess();
+
+    if (isResponse(access)) {
+      return access;
+    }
+
+    if (!canReadPayroll(access.user.role)) {
+      return forbidden("Your role does not allow this action");
+    }
+
     const parsed = paymentBatchSchema.safeParse(await request.json());
 
     if (!parsed.success) {
       return badRequest(parsed.error.issues[0]?.message ?? "Invalid request");
+    }
+
+    const payrun = await db.query.payruns.findFirst({
+      where: eq(payruns.id, parsed.data.payrunId),
+    });
+
+    if (!payrun || payrun.organizationId !== access.organizationId) {
+      return notFound("Payrun not found");
     }
 
     const [totals] = await db
@@ -53,7 +87,7 @@ export async function POST(request: Request) {
       .values({
         payrunId: parsed.data.payrunId,
         totalAmount: totals?.totalAmount ?? "0.00",
-        createdBy: parsed.data.createdBy,
+        createdBy: access.user.id,
       })
       .returning();
 

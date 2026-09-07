@@ -217,22 +217,45 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
     });
   }
 
-  for (const employeeId of employeeIds) {
-    const employee = await db.query.employees.findFirst({
-      where: eq(employees.id, employeeId),
-    });
+  if (employeeIds.length === 0) {
+    await db
+      .update(payruns)
+      .set({ status: "computed" })
+      .where(eq(payruns.id, payrunId));
 
-    if (!employee) {
-      continue;
-    }
+    return {
+      payrun: { ...payrun, status: "computed" },
+      summary: {
+        payslipCount: 0,
+        grossTotal: "0.00",
+        netTotal: "0.00",
+        deductionTotal: "0.00",
+      },
+      warnings,
+      results: [],
+    };
+  }
 
-    // Only contracts overlapping the payroll period are eligible.
-    const periodContracts = await db
+  // Pre-fetch all dependencies in parallel for maximum speed on cloud databases
+  const [
+    allEmployees,
+    allContracts,
+    allAttendance,
+    allLeaves,
+    allScheduleLines,
+    allBankAccounts,
+    allDuplicates,
+  ] = await Promise.all([
+    db
+      .select()
+      .from(employees)
+      .where(inArray(employees.id, employeeIds)),
+    db
       .select()
       .from(contracts)
       .where(
         and(
-          eq(contracts.employeeId, employeeId),
+          inArray(contracts.employeeId, employeeIds),
           eq(contracts.status, "active"),
           lte(contracts.startDate, payrun.periodEnd),
           or(
@@ -241,8 +264,148 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
           ),
         ),
       )
-      .orderBy(asc(contracts.startDate));
+      .orderBy(asc(contracts.startDate)),
+    db
+      .select()
+      .from(attendanceRecords)
+      .where(
+        and(
+          inArray(attendanceRecords.employeeId, employeeIds),
+          gte(attendanceRecords.attendanceDate, payrun.periodStart),
+          lte(attendanceRecords.attendanceDate, payrun.periodEnd),
+        ),
+      ),
+    db
+      .select({
+        employeeId: timeOffRequests.employeeId,
+        durationDays: timeOffRequests.durationDays,
+        typeName: timeOffRequests.typeName,
+        isPaid: timeOffTypes.isPaid,
+        affectsPayroll: timeOffTypes.affectsPayroll,
+      })
+      .from(timeOffRequests)
+      .leftJoin(
+        timeOffTypes,
+        eq(timeOffRequests.timeOffTypeId, timeOffTypes.id),
+      )
+      .where(
+        and(
+          inArray(timeOffRequests.employeeId, employeeIds),
+          eq(timeOffRequests.status, "approved"),
+          lte(timeOffRequests.startDate, payrun.periodEnd),
+          gte(timeOffRequests.endDate, payrun.periodStart),
+        ),
+      ),
+    db
+      .select({
+        employeeId: employeeWorkingSchedules.employeeId,
+        dayOfWeek: workingScheduleLines.dayOfWeek,
+      })
+      .from(employeeWorkingSchedules)
+      .innerJoin(
+        workingScheduleLines,
+        eq(workingScheduleLines.scheduleId, employeeWorkingSchedules.scheduleId),
+      )
+      .where(
+        and(
+          inArray(employeeWorkingSchedules.employeeId, employeeIds),
+          lte(employeeWorkingSchedules.effectiveFrom, payrun.periodEnd),
+          or(
+            isNull(employeeWorkingSchedules.effectiveTo),
+            gte(employeeWorkingSchedules.effectiveTo, payrun.periodStart),
+          ),
+        ),
+      ),
+    db
+      .select({
+        employeeId: employeeBankAccounts.employeeId,
+      })
+      .from(employeeBankAccounts)
+      .where(inArray(employeeBankAccounts.employeeId, employeeIds)),
+    db
+      .select({
+        employeeId: payslips.employeeId,
+        payrunName: payruns.name,
+      })
+      .from(payslips)
+      .innerJoin(payruns, eq(payslips.payrunId, payruns.id))
+      .where(
+        and(
+          inArray(payslips.employeeId, employeeIds),
+          ne(payslips.payrunId, payrunId),
+          lte(payruns.periodStart, payrun.periodEnd),
+          gte(payruns.periodEnd, payrun.periodStart),
+        ),
+      ),
+  ]);
 
+  const employeeMap = new Map(allEmployees.map((e) => [e.id, e]));
+
+  const contractsByEmp = new Map<string, typeof allContracts>();
+  for (const c of allContracts) {
+    const list = contractsByEmp.get(c.employeeId) ?? [];
+    list.push(c);
+    contractsByEmp.set(c.employeeId, list);
+  }
+
+  const attendanceByEmp = new Map<string, typeof allAttendance>();
+  for (const a of allAttendance) {
+    const list = attendanceByEmp.get(a.employeeId) ?? [];
+    list.push(a);
+    attendanceByEmp.set(a.employeeId, list);
+  }
+
+  const leavesByEmp = new Map<string, typeof allLeaves>();
+  for (const l of allLeaves) {
+    const list = leavesByEmp.get(l.employeeId) ?? [];
+    list.push(l);
+    leavesByEmp.set(l.employeeId, list);
+  }
+
+  const scheduleLinesByEmp = new Map<string, typeof allScheduleLines>();
+  for (const s of allScheduleLines) {
+    const list = scheduleLinesByEmp.get(s.employeeId) ?? [];
+    list.push(s);
+    scheduleLinesByEmp.set(s.employeeId, list);
+  }
+
+  const bankAccountSet = new Set(allBankAccounts.map((b) => b.employeeId));
+
+  const duplicateMap = new Map<string, string>();
+  for (const d of allDuplicates) {
+    duplicateMap.set(d.employeeId, d.payrunName);
+  }
+
+  type PreparedSlip = {
+    employeeId: string;
+    contractId: string;
+    workedDays: string;
+    leaveDays: string;
+    grossPay: string;
+    totalDeductions: string;
+    netPay: string;
+    lines: SalaryLine[];
+    resultMeta: {
+      employeeName: string;
+      workedDays: number;
+      expectedDays: number;
+      leaveDays: number;
+      grossPay: number;
+      totalDeductions: number;
+      netPay: number;
+    };
+  };
+
+  const preparedSlips: PreparedSlip[] = [];
+
+  for (const employeeId of employeeIds) {
+    const employee = employeeMap.get(employeeId);
+
+    if (!employee) {
+      continue;
+    }
+
+    const periodContracts = contractsByEmp.get(employeeId) ?? [];
     const activeContract = periodContracts[periodContracts.length - 1];
 
     if (!activeContract) {
@@ -262,58 +425,9 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
       });
     }
 
-    const attendance = await db
-      .select()
-      .from(attendanceRecords)
-      .where(
-        and(
-          eq(attendanceRecords.employeeId, employeeId),
-          gte(attendanceRecords.attendanceDate, payrun.periodStart),
-          lte(attendanceRecords.attendanceDate, payrun.periodEnd),
-        ),
-      );
-
-    const approvedLeaves = await db
-      .select({
-        durationDays: timeOffRequests.durationDays,
-        typeName: timeOffRequests.typeName,
-        isPaid: timeOffTypes.isPaid,
-        affectsPayroll: timeOffTypes.affectsPayroll,
-      })
-      .from(timeOffRequests)
-      .leftJoin(
-        timeOffTypes,
-        eq(timeOffRequests.timeOffTypeId, timeOffTypes.id),
-      )
-      .where(
-        and(
-          eq(timeOffRequests.employeeId, employeeId),
-          eq(timeOffRequests.status, "approved"),
-          lte(timeOffRequests.startDate, payrun.periodEnd),
-          gte(timeOffRequests.endDate, payrun.periodStart),
-        ),
-      );
-
-    // Expected working days come from the assigned schedule when there is one.
-    const scheduleLines = await db
-      .select({
-        dayOfWeek: workingScheduleLines.dayOfWeek,
-      })
-      .from(employeeWorkingSchedules)
-      .innerJoin(
-        workingScheduleLines,
-        eq(workingScheduleLines.scheduleId, employeeWorkingSchedules.scheduleId),
-      )
-      .where(
-        and(
-          eq(employeeWorkingSchedules.employeeId, employeeId),
-          lte(employeeWorkingSchedules.effectiveFrom, payrun.periodEnd),
-          or(
-            isNull(employeeWorkingSchedules.effectiveTo),
-            gte(employeeWorkingSchedules.effectiveTo, payrun.periodStart),
-          ),
-        ),
-      );
+    const attendance = attendanceByEmp.get(employeeId) ?? [];
+    const approvedLeaves = leavesByEmp.get(employeeId) ?? [];
+    const scheduleLines = scheduleLinesByEmp.get(employeeId) ?? [];
 
     const expectedDays = scheduleLines.length
       ? expectedDaysInPeriod(
@@ -369,22 +483,21 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
       const category = rule.category as RuleCategory;
       let amount: number;
 
-      if (category === "gross") {
+      if (rule.percentageBaseCode) {
+        const base = valuesByCode[rule.percentageBaseCode] ?? 0;
+        amount = base * (Number(rule.amount) / 100);
+      } else if (category === "gross") {
         amount = lines
           .filter((line) => earningCategories.includes(line.category))
           .reduce((total, line) => total + line.amount, 0);
       } else if (category === "net") {
-        const earned = lines
+        const gross = lines
           .filter((line) => earningCategories.includes(line.category))
           .reduce((total, line) => total + line.amount, 0);
-        const deducted = lines
+        const deductions = lines
           .filter((line) => line.category === "deduction")
           .reduce((total, line) => total + line.amount, 0);
-        amount = earned - deducted;
-      } else if (rule.percentageBaseCode) {
-        // Percentage of an earlier rule's result, or of the prorated wage.
-        const base = valuesByCode[rule.percentageBaseCode] ?? wage;
-        amount = base * (Number(rule.amount) / 100);
+        amount = gross - deductions;
       } else {
         amount = Number(rule.amount);
       }
@@ -413,31 +526,25 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
       lines.find((line) => line.category === "net")?.amount ??
       grossPay - totalDeductions;
 
-    const [payslip] = await db
-      .insert(payslips)
-      .values({
-        payrunId,
-        employeeId,
-        contractId: activeContract.id,
-        workedDays: money(workedDays),
-        leaveDays: money(leaveDays),
-        grossPay: money(grossPay),
-        totalDeductions: money(totalDeductions),
-        netPay: money(netPay),
-        status: "computed",
-      })
-      .returning();
-
-    await db.insert(payslipLines).values(
-      lines.map((line) => ({
-        payslipId: payslip.id,
-        name: line.name,
-        code: line.code,
-        category: line.category,
-        sequence: line.sequence,
-        amount: money(line.amount),
-      })),
-    );
+    preparedSlips.push({
+      employeeId,
+      contractId: activeContract.id,
+      workedDays: money(workedDays),
+      leaveDays: money(leaveDays),
+      grossPay: money(grossPay),
+      totalDeductions: money(totalDeductions),
+      netPay: money(netPay),
+      lines,
+      resultMeta: {
+        employeeName: `${employee.firstName} ${employee.lastName}`,
+        workedDays,
+        expectedDays,
+        leaveDays,
+        grossPay,
+        totalDeductions,
+        netPay,
+      },
+    });
 
     // ---- Pre-validation checks surfaced to the payroll officer ----
 
@@ -461,13 +568,7 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
       });
     }
 
-    const [bankAccount] = await db
-      .select({ id: employeeBankAccounts.id })
-      .from(employeeBankAccounts)
-      .where(eq(employeeBankAccounts.employeeId, employeeId))
-      .limit(1);
-
-    if (!bankAccount) {
+    if (!bankAccountSet.has(employeeId)) {
       warnings.push({
         employeeId,
         code: "MISSING_BANK_DETAILS",
@@ -475,26 +576,12 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
       });
     }
 
-    // The same employee already paid for an overlapping period in another payrun.
-    const [duplicate] = await db
-      .select({ payrunName: payruns.name })
-      .from(payslips)
-      .innerJoin(payruns, eq(payslips.payrunId, payruns.id))
-      .where(
-        and(
-          eq(payslips.employeeId, employeeId),
-          ne(payslips.payrunId, payrunId),
-          lte(payruns.periodStart, payrun.periodEnd),
-          gte(payruns.periodEnd, payrun.periodStart),
-        ),
-      )
-      .limit(1);
-
-    if (duplicate) {
+    const duplicatePayrunName = duplicateMap.get(employeeId);
+    if (duplicatePayrunName) {
       warnings.push({
         employeeId,
         code: "DUPLICATE_PAYSLIP",
-        message: `${employee.firstName} ${employee.lastName} already has a payslip for an overlapping period in "${duplicate.payrunName}".`,
+        message: `${employee.firstName} ${employee.lastName} already has a payslip for an overlapping period in "${duplicatePayrunName}".`,
       });
     }
 
@@ -505,18 +592,56 @@ export async function computePayrun(payrunId: string, organizationId?: string | 
         message: `Computed net pay for ${employee.firstName} ${employee.lastName} is ${money(netPay)}.`,
       });
     }
+  }
 
-    results.push({
-      payslipId: payslip.id,
-      employeeId,
-      employeeName: `${employee.firstName} ${employee.lastName}`,
-      workedDays,
-      expectedDays,
-      leaveDays,
-      grossPay,
-      totalDeductions,
-      netPay,
-    });
+  if (preparedSlips.length > 0) {
+    const insertedPayslips = await db
+      .insert(payslips)
+      .values(
+        preparedSlips.map((s) => ({
+          payrunId,
+          employeeId: s.employeeId,
+          contractId: s.contractId,
+          workedDays: s.workedDays,
+          leaveDays: s.leaveDays,
+          grossPay: s.grossPay,
+          totalDeductions: s.totalDeductions,
+          netPay: s.netPay,
+          status: "computed" as const,
+        })),
+      )
+      .returning();
+
+    const slipByEmployeeId = new Map(
+      insertedPayslips.map((p) => [p.employeeId, p]),
+    );
+
+    const allPayslipLinesToInsert = [];
+    for (const prepared of preparedSlips) {
+      const inserted = slipByEmployeeId.get(prepared.employeeId);
+      if (!inserted) continue;
+
+      results.push({
+        payslipId: inserted.id,
+        employeeId: prepared.employeeId,
+        ...prepared.resultMeta,
+      });
+
+      for (const line of prepared.lines) {
+        allPayslipLinesToInsert.push({
+          payslipId: inserted.id,
+          name: line.name,
+          code: line.code,
+          category: line.category,
+          sequence: line.sequence,
+          amount: money(line.amount),
+        });
+      }
+    }
+
+    if (allPayslipLinesToInsert.length > 0) {
+      await db.insert(payslipLines).values(allPayslipLinesToInsert);
+    }
   }
 
   if (warnings.length > 0) {

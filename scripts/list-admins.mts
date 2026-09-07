@@ -52,5 +52,5 @@ if (rows.length === 0) {
     );
     console.log("");
   }
-  console.log("The workspace with 251 employees is the seeded one.\n");
+  console.log("The workspace with 50 employees is the seeded one.\n");
 }
