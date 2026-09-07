@@ -1,8 +1,8 @@
 import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { departments, employees, payruns, payslips } from "@/db/schema";
-import { isResponse, resolveAccess } from "../_lib/access";
-import { ok, serverError } from "../_lib/responses";
+import { isResponse, resolveAccess, canReadPayroll } from "../_lib/access";
+import { forbidden, ok, serverError } from "../_lib/responses";
 
 export async function GET(request: Request) {
   try {
@@ -10,6 +10,10 @@ export async function GET(request: Request) {
 
     if (isResponse(access)) {
       return access;
+    }
+
+    if (!canReadPayroll(access.user.role) && !access.scopeEmployeeId) {
+      return forbidden("Your role does not allow this action");
     }
 
     const { searchParams } = new URL(request.url);

@@ -1,8 +1,9 @@
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
-import { auditLogs } from "@/db/schema";
-import { badRequest, created, ok, serverError } from "../_lib/responses";
+import { auditLogs, users } from "@/db/schema";
+import { isResponse, resolveAccess } from "../_lib/access";
+import { badRequest, created, forbidden, ok, serverError } from "../_lib/responses";
 
 const auditLogSchema = z.object({
   actorUserId: z.string().uuid().optional(),
@@ -16,20 +17,41 @@ const auditLogSchema = z.object({
 
 export async function GET(request: Request) {
   try {
+    const access = await resolveAccess();
+
+    if (isResponse(access)) {
+      return access;
+    }
+
+    if (access.user.role === "employee") {
+      return forbidden("Your role does not allow this action");
+    }
+
     const { searchParams } = new URL(request.url);
     const entityType = searchParams.get("entityType");
     const actorUserId = searchParams.get("actorUserId");
 
+    // Scope to users belonging to caller's organization
+    const orgUsers = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.organizationId, access.organizationId));
+    const orgUserIds = orgUsers.map((u) => u.id);
+
+    if (orgUserIds.length === 0) {
+      return ok([]);
+    }
+
+    const filters = [
+      inArray(auditLogs.actorUserId, orgUserIds),
+      entityType ? eq(auditLogs.entityType, entityType) : undefined,
+      actorUserId ? eq(auditLogs.actorUserId, actorUserId) : undefined,
+    ].filter(Boolean);
+
     const rows = await db
       .select()
       .from(auditLogs)
-      .where(
-        entityType
-          ? eq(auditLogs.entityType, entityType)
-          : actorUserId
-            ? eq(auditLogs.actorUserId, actorUserId)
-            : undefined,
-      )
+      .where(and(...filters))
       .orderBy(desc(auditLogs.createdAt));
 
     return ok(rows);
@@ -40,6 +62,16 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const access = await resolveAccess();
+
+    if (isResponse(access)) {
+      return access;
+    }
+
+    if (access.user.role === "employee") {
+      return forbidden("Your role does not allow this action");
+    }
+
     const parsed = auditLogSchema.safeParse(await request.json());
 
     if (!parsed.success) {
@@ -50,6 +82,7 @@ export async function POST(request: Request) {
       .insert(auditLogs)
       .values({
         ...parsed.data,
+        actorUserId: access.user.id,
         metadata: parsed.data.metadata
           ? JSON.stringify(parsed.data.metadata)
           : undefined,

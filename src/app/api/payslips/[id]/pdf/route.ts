@@ -1,6 +1,6 @@
 import { loadPayslip } from "@/lib/payroll/payslip-data";
 import { payslipFileName, renderPayslipPdf } from "@/lib/payroll/payslip-pdf";
-import { isResponse, resolveAccess } from "../../../_lib/access";
+import { isResponse, resolveAccess, canReadPayroll } from "../../../_lib/access";
 import { forbidden, notFound, serverError } from "../../../_lib/responses";
 
 type Params = { params: Promise<{ id: string }> };
@@ -23,8 +23,8 @@ export async function GET(request: Request, ctx: Params) {
       return notFound("Payslip not found");
     }
 
-    // Employees may only open their own payslip.
-    if (access.scopeEmployeeId && payslip.employeeId !== access.scopeEmployeeId) {
+    // Non-payroll roles may only open their own payslip.
+    if (!canReadPayroll(access.user.role) && payslip.employeeId !== access.scopeEmployeeId) {
       return forbidden("You can only view your own payslip");
     }
 
